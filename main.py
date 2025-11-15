@@ -1,17 +1,29 @@
 from flask import Flask, request, jsonify
-import psycopg2
 import os
 from urllib.parse import urlparse
 
 app = Flask(__name__)
 
-# Функция для подключения к базе данных
+# Попробуем импортировать psycopg2 с обработкой ошибок
+try:
+    import psycopg2
+    PSYCOPG2_AVAILABLE = True
+    print("✅ psycopg2 imported successfully")
+except ImportError as e:
+    print(f"❌ psycopg2 import failed: {e}")
+    PSYCOPG2_AVAILABLE = False
+    # Покажем альтернативное сообщение
+    print("⚠️  Database features will be disabled")
+
+# Функция для подключения к БД
 def get_db_connection():
+    if not PSYCOPG2_AVAILABLE:
+        print("❌ psycopg2 not available - database disabled")
+        return None
+        
     DATABASE_URL = os.environ.get('DATABASE_URL')
-    print(f"DATABASE_URL: {DATABASE_URL}")  # Для отладки
-    
     if not DATABASE_URL:
-        print("❌ DATABASE_URL not found!")
+        print("❌ DATABASE_URL not found")
         return None
     
     try:
@@ -26,13 +38,13 @@ def get_db_connection():
         print("✅ Database connected successfully!")
         return conn
     except Exception as e:
-        print(f"❌ Database connection failed: {e}")
+        print(f"❌ Database connection error: {e}")
         return None
 
-# Глобальное подключение
+# Подключение к БД
 conn = get_db_connection()
 
-# Создаем таблицу при запуске
+# Создание таблицы
 if conn:
     try:
         with conn.cursor() as cur:
@@ -44,79 +56,82 @@ if conn:
                 )
             """)
             conn.commit()
-            print("✅ Table 'messages' ready!")
+            print("✅ Table created successfully")
     except Exception as e:
         print(f"❌ Table creation error: {e}")
 
-# Маршрут 1: Главная страница
+# Временное хранилище (на случай если БД не работает)
+temp_storage = []
+
 @app.route('/')
 def hello():
-    return "🚀 Hello, Serverless! Lab 4 is working!\n", 200, {'Content-Type': 'text/plain'}
+    db_status = "connected" if conn else "disconnected"
+    return f"🚀 Hello, Serverless! Database: {db_status}\n", 200
 
-# Маршрут 2: Эхо-эндпоинт
 @app.route('/echo', methods=['POST'])
 def echo():
     data = request.get_json()
     return jsonify({
         "status": "received",
         "you_sent": data,
-        "length": len(str(data)) if data else 0
+        "database": "available" if PSYCOPG2_AVAILABLE else "unavailable"
     })
 
-# Маршрут 3: Сохранить сообщение в БД
 @app.route('/save', methods=['POST'])
 def save_message():
-    if not conn:
-        return jsonify({"error": "Database not connected"}), 500
-    
     data = request.get_json()
     if not data:
-        return jsonify({"error": "No JSON data provided"}), 400
+        return jsonify({"error": "No JSON data"}), 400
     
     message = data.get('message', '')
     if not message:
-        return jsonify({"error": "Message field is required"}), 400
+        return jsonify({"error": "Message is required"}), 400
     
-    try:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO messages (content) VALUES (%s)", (message,))
-            conn.commit()
-        
+    # Пробуем сохранить в БД, если доступна
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO messages (content) VALUES (%s)", (message,))
+                conn.commit()
+            return jsonify({
+                "status": "saved to database",
+                "message": message,
+                "storage": "postgresql"
+            })
+        except Exception as e:
+            return jsonify({"error": f"Database error: {str(e)}"}), 500
+    else:
+        # Сохраняем во временное хранилище
+        temp_storage.append(message)
         return jsonify({
-            "status": "success", 
-            "message": "Message saved to database",
-            "saved_text": message
+            "status": "saved to memory",
+            "message": message,
+            "storage": "temporary memory",
+            "note": "Database not available"
         })
-    except Exception as e:
-        return jsonify({"error": f"Database error: {str(e)}"}), 500
 
-# Маршрут 4: Получить сообщения из БД
 @app.route('/messages')
 def get_messages():
-    if not conn:
-        return jsonify({"error": "Database not connected"}), 500
-    
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, content, created_at FROM messages ORDER BY id DESC LIMIT 10")
-            rows = cur.fetchall()
-        
-        messages = []
-        for row in rows:
-            messages.append({
-                "id": row[0],
-                "text": row[1],
-                "time": row[2].isoformat() if row[2] else None
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, content, created_at FROM messages ORDER BY id DESC LIMIT 10")
+                rows = cur.fetchall()
+            messages = [{"id": r[0], "text": r[1], "time": str(r[2])} for r in rows]
+            return jsonify({
+                "status": "from database",
+                "count": len(messages),
+                "messages": messages
             })
-        
+        except Exception as e:
+            return jsonify({"error": f"Database error: {str(e)}"}), 500
+    else:
         return jsonify({
-            "status": "success",
-            "count": len(messages),
-            "messages": messages
+            "status": "from memory",
+            "count": len(temp_storage),
+            "messages": temp_storage,
+            "note": "Database not available - using temporary storage"
         })
-    except Exception as e:
-        return jsonify({"error": f"Database error: {str(e)}"}), 500
 
-# Запуск приложения
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000)
